@@ -9,12 +9,13 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 from tqdm import tqdm
+import multiprocessing as mp
 
 from patient_selection_v7 import (
     canonical_patient_id,
@@ -237,6 +238,35 @@ def validate_input_consistency(
     return result
 
 
+def _is_patient_processed(output_dir: Path, patient_id: str) -> bool:
+    """检查病人是否已经处理完成（检查标准化文件是否存在）。"""
+    normalized_path = output_dir / patient_id / f"{patient_id}_normalized.nii.gz"
+    return normalized_path.exists()
+
+
+def _preprocess_single_patient(args_tuple):
+    """单个病人预处理（多进程用）。"""
+    image_path, label_path, patient_id, patient_output_dir, csf_mean, csf_median, n4_shrink_factor = args_tuple
+    try:
+        log = process_single_patient(
+            str(image_path),
+            str(label_path),
+            patient_id,
+            str(patient_output_dir),
+            csf_mean=csf_mean,
+            csf_median=csf_median,
+            n4_shrink_factor=n4_shrink_factor,
+        )
+        return {"success": True, "log": log}
+    except Exception as e:
+        return {
+            "success": False,
+            "patient_id": patient_id,
+            "error_type": type(e).__name__,
+            "error_msg": str(e),
+        }
+
+
 def batch_process(
     images_dir: str,
     labels_dir: str,
@@ -244,6 +274,8 @@ def batch_process(
     patient_list_file: str,
     n4_shrink_factor: int = 4,
     continue_on_error: bool = True,
+    resume: bool = True,
+    num_workers: int = 1,
 ) -> Dict:
     """批量预处理。
 
@@ -251,9 +283,11 @@ def batch_process(
         images_dir: 原始图像目录
         labels_dir: 分割标签目录
         output_dir: 输出目录
-        patient_list_file: 病人列表 Excel（含 patient_id 和 CSF 值）
+        patient_list_file: 病人列表 CSV/Excel（含 patient_id 和 CSF 值）
         n4_shrink_factor: N4 缩小因子
         continue_on_error: 单个病人失败时是否继续
+        resume: 断点续传，跳过已处理的病人（默认 True）
+        num_workers: 并行进程数，1为串行（默认 1）
 
     Returns:
         汇总字典
@@ -261,6 +295,7 @@ def batch_process(
     images_root, labels_root, output_root = map(
         Path, (images_dir, labels_dir, output_dir)
     )
+    output_root.mkdir(parents=True, exist_ok=True)
 
     patient_ids, csf_values = load_patient_list_with_csf(patient_list_file)
 
@@ -290,46 +325,110 @@ def batch_process(
         names = [patient_ids[key] for key in sorted(missing)]
         raise FileNotFoundError(f"缺少 MRI 图像的患者: {names}")
 
-    successful = []
-    failed = []
-    for image_path in tqdm(images, desc="v7 图像预处理"):
+    # 构建任务列表（支持断点续传）
+    tasks = []
+    skipped_count = 0
+    for image_path in images:
         key = canonical_patient_id(patient_id_from_nifti(image_path))
         patient_id = patient_ids[key]
+        
+        if resume and _is_patient_processed(output_root, patient_id):
+            skipped_count += 1
+            continue
+        
         try:
             label_path = _find_label(labels_root, patient_id)
-            csf_mean = csf_values[key]
-            log = process_single_patient(
-                str(image_path),
-                str(label_path),
-                patient_id,
-                str(output_root / patient_id),
-                csf_mean=csf_mean,
-                csf_median=None,
-                n4_shrink_factor=n4_shrink_factor,
-            )
-            successful.append(log)
-        except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            failed.append({
-                "patient_id": patient_id,
-                "reason": error_msg,
-                "error_type": error_type,
-            })
-            tqdm.write(f"  ⚠️  {patient_id} 预处理失败: {error_type} - {error_msg}")
-            if not continue_on_error:
-                raise
+        except FileNotFoundError as e:
+            if continue_on_error:
+                continue
+            raise
+        
+        csf_mean = csf_values[key]
+        patient_output_dir = output_root / patient_id
+        tasks.append((
+            image_path, label_path, patient_id, patient_output_dir,
+            csf_mean, None, n4_shrink_factor
+        ))
 
-    output_root.mkdir(parents=True, exist_ok=True)
+    if skipped_count > 0:
+        print(f"断点续传：跳过已处理病人 {skipped_count} 人")
+    print(f"待处理病人: {len(tasks)} 人")
+    print()
+
+    successful: List[Dict] = []
+    failed: List[Dict] = []
+
+    if not tasks:
+        print("所有病人均已处理完成")
+    elif num_workers <= 1:
+        # 串行处理
+        for task in tqdm(tasks, desc="v7 图像预处理"):
+            patient_id = task[2]
+            result = _preprocess_single_patient(task)
+            if result["success"]:
+                successful.append(result["log"])
+            else:
+                failed.append({
+                    "patient_id": patient_id,
+                    "reason": result["error_msg"],
+                    "error_type": result["error_type"],
+                })
+                tqdm.write(f"  ⚠️  {patient_id} 预处理失败: {result['error_type']} - {result['error_msg']}")
+                if not continue_on_error:
+                    raise Exception(result["error_msg"])
+    else:
+        # 多进程并行处理
+        print(f"使用 {num_workers} 个进程并行预处理（注意：N4校正内存占用大，进程数不宜过多）")
+        with mp.Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_preprocess_single_patient, tasks),
+                total=len(tasks),
+                desc="v7 图像预处理 (并行)",
+            ))
+        
+        for result in results:
+            if result["success"]:
+                successful.append(result["log"])
+            else:
+                failed.append({
+                    "patient_id": result["patient_id"],
+                    "reason": result["error_msg"],
+                    "error_type": result["error_type"],
+                })
+                tqdm.write(
+                    f"  ⚠️  {result['patient_id']} 预处理失败: {result['error_type']} - {result['error_msg']}"
+                )
+
+    # 汇总已处理的病人（包括断点续传跳过的）
+    all_successful_ids = set(x["patient_id"] for x in successful)
+    if resume:
+        for image_path in images:
+            key = canonical_patient_id(patient_id_from_nifti(image_path))
+            patient_id = patient_ids[key]
+            if patient_id not in all_successful_ids and _is_patient_processed(output_root, patient_id):
+                all_successful_ids.add(patient_id)
+                # 读取日志文件
+                log_file = output_root / patient_id / f"{patient_id}_log_v7.json"
+                if log_file.exists():
+                    try:
+                        with open(log_file, "r", encoding="utf-8") as f:
+                            successful.append(json.load(f))
+                    except Exception:
+                        successful.append({"patient_id": patient_id, "status": "success", "skipped": True})
+                else:
+                    successful.append({"patient_id": patient_id, "status": "success", "skipped": True})
+
     summary = {
         "version": "v7",
         "total_requested": len(patient_ids),
         "success_count": len(successful),
         "failed_count": len(failed),
-        "successful_patients": [x["patient_id"] for x in successful],
+        "successful_patients": sorted([x["patient_id"] for x in successful]),
         "failed_patients": failed,
         "index_by": "patient_id",
         "continue_on_error": continue_on_error,
+        "resume": resume,
+        "num_workers": num_workers,
         "validation": validation,
     }
     (output_root / "batch_processing_log_v7.json").write_text(
@@ -341,6 +440,9 @@ def batch_process(
 
 def main():
     """使用文件顶部的固定路径执行预处理。"""
+    # 性能优化配置：
+    # - resume=True: 断点续传，跳过已处理的病人
+    # - num_workers: 并行进程数（建议2-3，N4校正内存占用大，进程数不宜过多）
     summary = batch_process(
         images_dir=IMAGES_DIR,
         labels_dir=LABELS_DIR,
@@ -348,6 +450,8 @@ def main():
         patient_list_file=PATIENT_LIST_FILE,
         n4_shrink_factor=4,
         continue_on_error=True,
+        resume=True,
+        num_workers=3,  # 可根据机器配置调整，1为串行
     )
     print(f"\n输出目录: {OUTPUT_DIR}")
 

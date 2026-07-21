@@ -10,7 +10,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -18,6 +18,8 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import multiprocessing as mp
+from functools import partial
 
 from fat_threshold_v7 import get_fat_threshold_per_muscle
 from muscle_feature_calculator_v7 import (
@@ -440,6 +442,108 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _get_csv_paths(output_root: Path) -> Dict[str, Path]:
+    """获取四个CSV文件的路径。"""
+    return {
+        "2d": output_root / "muscle_features_2d_v7.csv",
+        "3d": output_root / "muscle_features_3d_v7.csv",
+        "level3_cross": output_root / "muscle_features_level3_cross_v7.csv",
+        "level3_multi": output_root / "muscle_features_level3_multi_v7.csv",
+    }
+
+
+def _load_processed_patients(csv_path: Path) -> set:
+    """从已有的CSV文件中加载已处理的病人ID，用于断点续传。"""
+    if not csv_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(csv_path, nrows=0, encoding="utf-8-sig")
+        if "patient_id" not in df.columns:
+            return set()
+        df = pd.read_csv(csv_path, usecols=["patient_id"], encoding="utf-8-sig")
+        return set(df["patient_id"].astype(str).unique())
+    except Exception:
+        return set()
+
+
+def _init_csv_files(output_root: Path, sample_2d, sample_3d, sample_cross, sample_multi):
+    """初始化CSV文件，写入表头（如果文件不存在）。"""
+    csv_paths = _get_csv_paths(output_root)
+    samples = {
+        "2d": sample_2d,
+        "3d": sample_3d,
+        "level3_cross": sample_cross,
+        "level3_multi": sample_multi,
+    }
+    for key, sample_rows in samples.items():
+        path = csv_paths[key]
+        if not path.exists() and sample_rows:
+            df = pd.DataFrame(sample_rows[:1])
+            df = _reorder_columns(df)
+            df.head(0).to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _append_rows_to_csv(csv_path: Path, rows: List[Dict]):
+    """将数据行追加到CSV文件。"""
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df = _reorder_columns(df)
+    df.to_csv(csv_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+
+
+def _extract_single_patient(args_tuple):
+    """单个病人特征提取（多进程用）。"""
+    patient_id, patient_dir, labels_dir, csf_value = args_tuple
+    try:
+        from pathlib import Path
+        patient_dir_p = Path(patient_dir)
+        labels_dir_p = Path(labels_dir)
+        
+        # 查找标准化图像
+        exact = patient_dir_p / f"{patient_id}_normalized.nii.gz"
+        if exact.exists():
+            image_path = exact
+        else:
+            matches = list(patient_dir_p.glob("*_normalized.nii.gz"))
+            if len(matches) != 1:
+                raise FileNotFoundError(f"Expected one normalized image in {patient_dir_p}, found {len(matches)}")
+            image_path = matches[0]
+        
+        # 查找标签文件
+        from patient_selection_v7 import canonical_patient_id, patient_id_from_nifti
+        candidates = list(labels_dir_p.glob("*.nii.gz")) + list(labels_dir_p.glob("*.nii"))
+        matches = [
+            p for p in candidates
+            if canonical_patient_id(patient_id_from_nifti(p)) == canonical_patient_id(patient_id)
+        ]
+        if len(matches) == 0:
+            raise FileNotFoundError(f"未找到 patient_id={patient_id} 的标签文件")
+        if len(matches) > 1:
+            raise FileNotFoundError(f"patient_id={patient_id} 匹配到多个标签文件: {matches}")
+        label_path = matches[0]
+        
+        # 提取特征
+        rows_2d, rows_3d, rows_cross, row_multi = extract_patient(
+            str(image_path), str(label_path), patient_id, csf_value=csf_value
+        )
+        return {
+            "success": True,
+            "patient_id": patient_id,
+            "rows_2d": rows_2d,
+            "rows_3d": rows_3d,
+            "rows_cross": rows_cross,
+            "row_multi": row_multi,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "patient_id": patient_id,
+            "error_type": type(e).__name__,
+            "error_msg": str(e),
+        }
+
+
 def batch_extract(
     preprocessed_dir,
     labels_dir,
@@ -447,6 +551,9 @@ def batch_extract(
     patient_list_file,
     continue_on_error: bool = True,
     generate_report: bool = True,
+    incremental_save: bool = True,
+    resume: bool = True,
+    num_workers: int = 1,
 ):
     """批量提取特征（以 patient_id 为索引）。
 
@@ -454,9 +561,12 @@ def batch_extract(
         preprocessed_dir: 预处理后图像目录
         labels_dir: 分割标签目录
         output_dir: 输出目录
-        patient_list_file: 病人列表 Excel
+        patient_list_file: 病人列表 CSV/Excel
         continue_on_error: 单个病人失败时是否继续（默认 True）
         generate_report: 是否生成检测报告和一致性检查（默认 True）
+        incremental_save: 增量保存CSV，每处理完一个病人就写入文件（默认 True）
+        resume: 断点续传，跳过已处理的病人（默认 True，需要 incremental_save=True）
+        num_workers: 并行进程数，1为串行（默认 1）
 
     Returns:
         汇总字典
@@ -465,6 +575,8 @@ def batch_extract(
     preprocessed_root, labels_root, output_root = map(
         Path, (preprocessed_dir, labels_dir, output_dir)
     )
+    output_root.mkdir(parents=True, exist_ok=True)
+    
     available = {
         canonical_patient_id(path.name): path
         for path in preprocessed_root.iterdir() if path.is_dir()
@@ -474,48 +586,123 @@ def batch_extract(
         names = [patient_ids[key] for key in sorted(missing)]
         raise FileNotFoundError(f"缺少预处理数据的患者: {names}")
 
+    # 断点续传：加载已处理的病人
+    csv_paths = _get_csv_paths(output_root)
+    processed_patients = set()
+    if resume and incremental_save:
+        processed_patients = _load_processed_patients(csv_paths["2d"])
+        if processed_patients:
+            tqdm.write(f"发现已处理病人 {len(processed_patients)} 人，将跳过")
+
     successful_patients: List[str] = []
     failed_patients: List[Dict] = []
-    all_2d, all_3d, all_cross, all_multi = [], [], [], []
-
-    for key in tqdm(sorted(patient_ids.keys()), desc="v7 特征提取"):
+    row_counts = {"2d": 0, "3d": 0, "level3_cross": 0, "level3_multi": 0}
+    
+    # 构建任务列表
+    tasks = []
+    for key in sorted(patient_ids.keys()):
         patient_id = patient_ids[key]
+        if resume and patient_id in processed_patients:
+            successful_patients.append(patient_id)
+            continue
         patient_dir = available[key]
         csf_value = csf_values.get(key)
-        try:
-            image_path = _find_normalized(patient_dir, patient_id)
-            label_path = _find_label(labels_root, patient_id)
-            rows_2d, rows_3d, rows_cross, row_multi = extract_patient(
-                image_path, label_path, patient_id, csf_value=csf_value
-            )
-            all_2d.extend(rows_2d)
-            all_3d.extend(rows_3d)
-            all_cross.extend(rows_cross)
-            all_multi.append(row_multi)
-            successful_patients.append(patient_id)
-        except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            failed_patients.append({
-                "patient_id": patient_id,
-                "reason": error_msg,
-                "error_type": error_type,
-            })
-            tqdm.write(f"  ⚠️  {patient_id} 提取失败: {error_type} - {error_msg}")
-            if not continue_on_error:
-                raise
+        tasks.append((patient_id, str(patient_dir), str(labels_root), csf_value))
 
-    output_root.mkdir(parents=True, exist_ok=True)
-    outputs = {
-        "2d": (all_2d, "muscle_features_2d_v7.csv"),
-        "3d": (all_3d, "muscle_features_3d_v7.csv"),
-        "level3_cross": (all_cross, "muscle_features_level3_cross_v7.csv"),
-        "level3_multi": (all_multi, "muscle_features_level3_multi_v7.csv"),
-    }
-    for rows, filename in outputs.values():
-        df = pd.DataFrame(rows)
-        df = _reorder_columns(df)
-        df.to_csv(output_root / filename, index=False, encoding="utf-8-sig")
+    if not tasks:
+        tqdm.write("所有病人均已处理，无需重新提取")
+    elif num_workers <= 1:
+        # 串行处理（支持增量保存）
+        csv_initialized = False
+        for patient_id, patient_dir_str, labels_dir_str, csf_value in tqdm(
+            tasks, desc="v7 特征提取"
+        ):
+            result = _extract_single_patient(
+                (patient_id, patient_dir_str, labels_dir_str, csf_value)
+            )
+            if result["success"]:
+                if incremental_save:
+                    if not csv_initialized:
+                        _init_csv_files(
+                            output_root,
+                            result["rows_2d"],
+                            result["rows_3d"],
+                            result["rows_cross"],
+                            [result["row_multi"]],
+                        )
+                        csv_initialized = True
+                    _append_rows_to_csv(csv_paths["2d"], result["rows_2d"])
+                    _append_rows_to_csv(csv_paths["3d"], result["rows_3d"])
+                    _append_rows_to_csv(csv_paths["level3_cross"], result["rows_cross"])
+                    _append_rows_to_csv(csv_paths["level3_multi"], [result["row_multi"]])
+                
+                row_counts["2d"] += len(result["rows_2d"])
+                row_counts["3d"] += len(result["rows_3d"])
+                row_counts["level3_cross"] += len(result["rows_cross"])
+                row_counts["level3_multi"] += 1
+                successful_patients.append(patient_id)
+            else:
+                failed_patients.append({
+                    "patient_id": patient_id,
+                    "reason": result["error_msg"],
+                    "error_type": result["error_type"],
+                })
+                tqdm.write(
+                    f"  ⚠️  {patient_id} 提取失败: {result['error_type']} - {result['error_msg']}"
+                )
+                if not continue_on_error:
+                    raise Exception(result["error_msg"])
+    else:
+        # 多进程并行处理
+        tqdm.write(f"使用 {num_workers} 个进程并行提取特征")
+        with mp.Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap_unordered(_extract_single_patient, tasks),
+                total=len(tasks),
+                desc="v7 特征提取 (并行)",
+            ))
+        
+        # 收集结果
+        all_2d, all_3d, all_cross, all_multi = [], [], [], []
+        for result in results:
+            if result["success"]:
+                all_2d.extend(result["rows_2d"])
+                all_3d.extend(result["rows_3d"])
+                all_cross.extend(result["rows_cross"])
+                all_multi.append(result["row_multi"])
+                successful_patients.append(result["patient_id"])
+            else:
+                failed_patients.append({
+                    "patient_id": result["patient_id"],
+                    "reason": result["error_msg"],
+                    "error_type": result["error_type"],
+                })
+                tqdm.write(
+                    f"  ⚠️  {result['patient_id']} 提取失败: {result['error_type']} - {result['error_msg']}"
+                )
+        
+        # 统一写入（多进程模式下增量保存较复杂，统一写入）
+        for key, rows in [
+            ("2d", all_2d),
+            ("3d", all_3d),
+            ("level3_cross", all_cross),
+            ("level3_multi", all_multi),
+        ]:
+            if rows:
+                df = pd.DataFrame(rows)
+                df = _reorder_columns(df)
+                df.to_csv(csv_paths[key], index=False, encoding="utf-8-sig")
+            row_counts[key] = len(rows)
+
+    # 如果是增量保存但不是从头开始，需要统计总行数
+    if incremental_save and num_workers <= 1:
+        for key, path in csv_paths.items():
+            if path.exists():
+                try:
+                    df = pd.read_csv(path, usecols=[0], encoding="utf-8-sig")
+                    row_counts[key] = len(df)
+                except Exception:
+                    pass
 
     consistency_result = None
     report_path = None
@@ -531,8 +718,14 @@ def batch_extract(
         tqdm.write(f"  标签文件: {validation_result['label_files_found']} 人")
 
     if generate_report and successful_patients:
+        # 从CSV文件读取数据做一致性检查（增量保存模式）
+        all_2d_check, all_3d_check, all_cross_check, all_multi_check = [], [], [], []
+        if num_workers <= 1 and incremental_save:
+            if csv_paths["2d"].exists():
+                all_2d_check = pd.read_csv(csv_paths["2d"], nrows=0, encoding="utf-8-sig").columns.tolist()
+        
         consistency_result = check_csv_consistency(
-            successful_patients, all_2d, all_3d, all_cross, all_multi
+            successful_patients, all_2d_check, all_3d_check, all_cross_check, all_multi_check
         )
         report_path = save_extraction_report(
             str(output_root),
@@ -549,13 +742,16 @@ def batch_extract(
         "total_requested": len(patient_ids),
         "success_count": len(successful_patients),
         "failed_count": len(failed_patients),
-        "successful_patients": successful_patients,
+        "successful_patients": sorted(successful_patients),
         "failed_patients": failed_patients,
-        "row_counts": {key: len(rows) for key, (rows, _) in outputs.items()},
+        "row_counts": row_counts,
         "texture_bin_width": 0.025,
         "fat_threshold_policy": "2D v6 shared across all feature levels",
         "index_by": "patient_id",
         "continue_on_error": continue_on_error,
+        "incremental_save": incremental_save,
+        "resume": resume,
+        "num_workers": num_workers,
         "report_generated": report_path is not None,
         "validation": validation_result,
     }
@@ -567,6 +763,10 @@ def batch_extract(
 
 def main():
     """使用文件顶部的固定路径提取目标患者的特征。"""
+    # 性能优化配置：
+    # - incremental_save=True: 每处理完一个病人就保存CSV，降低内存占用
+    # - resume=True: 断点续传，跳过已处理的病人
+    # - num_workers: 并行进程数，根据CPU核心数调整（建议2-4，太多会内存不足）
     summary = batch_extract(
         preprocessed_dir=PREPROCESSED_DIR,
         labels_dir=LABELS_DIR,
@@ -574,6 +774,9 @@ def main():
         patient_list_file=PATIENT_LIST_FILE,
         continue_on_error=True,
         generate_report=True,
+        incremental_save=True,
+        resume=True,
+        num_workers=3,  # 可根据机器配置调整，1为串行
     )
     print(f"\n特征提取完成：成功 {summary['success_count']}/{summary['total_requested']} 人")
     print(f"输出目录: {OUTPUT_DIR}")
