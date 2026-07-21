@@ -1,4 +1,10 @@
-"""MRI 图像预处理 v7：物理空间 N4 偏置场校正与 CSF 信号归一化。"""
+"""MRI 图像预处理 v7：物理空间 N4 偏置场校正与 CSF 信号归一化。
+
+以 patient_id 为唯一标识符：
+  - images: "{patient_id}_{姓名拼音}_0000.nii.gz"
+  - labels: "{patient_id}_{姓名拼音}.nii.gz"
+  - 输出目录: "{output_dir}/{patient_id}/"
+"""
 
 import json
 from datetime import datetime
@@ -13,7 +19,7 @@ from tqdm import tqdm
 from patient_selection_v7 import (
     canonical_patient_id,
     filter_paths_to_patients,
-    load_patient_ids,
+    load_patient_list_with_csf,
     patient_id_from_nifti,
 )
 
@@ -21,16 +27,14 @@ from patient_selection_v7 import (
 # ==================== 固定路径配置 ====================
 IMAGES_DIR = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\images'
 LABELS_DIR = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\labels'
-OUTPUT_DIR = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\output_v7_20260719'
-CSF_FILE = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\csf_data.csv'
-PATIENT_LIST_FILE = r'E:\code\Proj_0501\Proj_0501\patient_stable_311.xlsx'
+OUTPUT_DIR = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\output_v7_20260721'
+PATIENT_LIST_FILE = r'D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\PATIENT_LIST_FILE.xlsx'
 
 
 def calculate_n4_shrink_factors(image: sitk.Image, shrink_factor: int):
     """根据真实体素间距计算各方向的自适应 N4 缩小倍数。"""
     spacing = image.GetSpacing()
     target_step = min(spacing) * int(shrink_factor)
-    # 使用明确的四舍五入，避免浮点数 3.499999 被 Python 的 round 取为 3。
     factors = [
         max(1, int(np.floor(target_step / value + 0.500001)))
         for value in spacing
@@ -59,8 +63,6 @@ def n4_bias_field_correction(
     if mask_image.GetSize() != original.GetSize():
         raise ValueError("N4 mask size does not match image size")
 
-    # 按真实 spacing 自适应缩小：以最小体素间距方向的 shrink_factor 为基准，
-    # 让各方向缩小后的物理采样间隔尽量接近。厚层方向通常保持为 1，避免过度降采样。
     factors = calculate_n4_shrink_factors(original, shrink_factor)
     working_image = sitk.Shrink(original, factors) if shrink_factor > 1 else original
     working_mask = sitk.Shrink(mask_image, factors) if shrink_factor > 1 else mask_image
@@ -72,8 +74,6 @@ def n4_bias_field_correction(
     log_bias = corrector.GetLogBiasFieldAsImage(original)
     corrected = original / sitk.Exp(log_bias)
 
-    # N4 的全局乘法尺度不是唯一的。这里恢复前景中位数，使 N4 前测量的
-    # CSF 参考值仍与校正后图像处于相同强度尺度，N4 只负责消除低频空间偏置。
     foreground = sitk.GetArrayViewFromImage(mask_image).astype(bool)
     before = sitk.GetArrayViewFromImage(original)[foreground]
     after = sitk.GetArrayViewFromImage(corrected)[foreground]
@@ -91,33 +91,6 @@ def decide_csf_reference(csf_mean: float, csf_median: Optional[float] = None):
     if csf_mean is not None and np.isfinite(csf_mean) and csf_mean > 0:
         return float(csf_mean), "MEAN"
     raise ValueError(f"No valid CSF reference: mean={csf_mean}, median={csf_median}")
-
-
-def load_csf_data(csv_path: str) -> Dict[str, Dict[str, Optional[float]]]:
-    try:
-        frame = pd.read_csv(csv_path, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        frame = pd.read_csv(csv_path, encoding="gbk")
-    if "patient_id" not in frame:
-        raise KeyError("CSF file must contain patient_id")
-    mean_column = "csf_mean" if "csf_mean" in frame else "csf_reference"
-    if mean_column not in frame:
-        raise KeyError("CSF file must contain csf_mean or csf_reference")
-
-    result = {}
-    for _, row in frame.iterrows():
-        patient_id = canonical_patient_id(row["patient_id"])
-        if not patient_id:
-            raise ValueError("CSF file contains an empty patient_id")
-        if patient_id in result:
-            raise ValueError(f"Duplicate patient_id in CSF file: {row['patient_id']}")
-        mean_value = pd.to_numeric(row[mean_column], errors="coerce")
-        median_value = pd.to_numeric(row.get("csf_median", np.nan), errors="coerce")
-        result[patient_id] = {
-            "mean": None if pd.isna(mean_value) else float(mean_value),
-            "median": None if pd.isna(median_value) else float(median_value),
-        }
-    return result
 
 
 def process_single_patient(
@@ -169,75 +142,214 @@ def process_single_patient(
 
 
 def _find_label(labels_dir: Path, patient_id: str) -> Path:
-    for suffix in (".nii.gz", ".nii"):
-        candidate = labels_dir / f"{patient_id}{suffix}"
-        if candidate.exists():
-            return candidate
+    """根据 patient_id 在 labels 目录查找匹配的标签文件。
+
+    支持文件名格式："{patient_id}_{姓名拼音}.nii.gz"
+    """
+    labels_root = Path(labels_dir)
+    candidates = list(labels_root.glob("*.nii.gz")) + list(labels_root.glob("*.nii"))
     matches = [
-        path for path in labels_dir.iterdir()
-        if path.is_file() and canonical_patient_id(patient_id_from_nifti(path)) == canonical_patient_id(patient_id)
+        path for path in candidates
+        if canonical_patient_id(patient_id_from_nifti(path)) == canonical_patient_id(patient_id)
     ]
-    if len(matches) != 1:
-        raise FileNotFoundError(f"Expected one label for {patient_id}, found {len(matches)}")
+    if len(matches) == 0:
+        raise FileNotFoundError(f"未找到 patient_id={patient_id} 的标签文件")
+    if len(matches) > 1:
+        raise FileNotFoundError(f"patient_id={patient_id} 匹配到多个标签文件: {matches}")
     return matches[0]
+
+
+def validate_input_consistency(
+    patient_ids: Dict[str, str],
+    csf_values: Dict[str, float],
+    images_dir: Path,
+    labels_dir: Path,
+) -> Dict:
+    """验证输入数据的一致性：PATIENT_LIST_FILE、图像文件、标签文件、CSF 值。
+
+    Args:
+        patient_ids: {canonical_id: original_id} 映射
+        csf_values: {canonical_id: csf_value} 映射
+        images_dir: 原始图像目录
+        labels_dir: 标签文件目录
+
+    Returns:
+        验证结果字典
+    """
+    images_root = Path(images_dir)
+    labels_root = Path(labels_dir)
+
+    image_candidates = list(images_root.glob("*.nii")) + list(images_root.glob("*.nii.gz"))
+    label_candidates = list(labels_root.glob("*.nii.gz")) + list(labels_root.glob("*.nii"))
+
+    image_ids = {
+        canonical_patient_id(patient_id_from_nifti(p)) for p in image_candidates
+    }
+    label_ids = {
+        canonical_patient_id(patient_id_from_nifti(p)) for p in label_candidates
+    }
+
+    result = {
+        "total_in_patient_list": len(patient_ids),
+        "total_images_found": len(image_ids),
+        "total_labels_found": len(label_ids),
+        "images_in_list": 0,
+        "images_missing_from_list": [],
+        "labels_in_list": 0,
+        "labels_missing_from_list": [],
+        "patients_missing_images": [],
+        "patients_missing_labels": [],
+        "patients_with_csf": 0,
+        "patients_missing_csf": [],
+        "csf_range": {"min": None, "max": None, "mean": None},
+    }
+
+    csf_list = []
+    for key in sorted(patient_ids.keys()):
+        patient_id = patient_ids[key]
+        if key in image_ids:
+            result["images_in_list"] += 1
+        else:
+            result["patients_missing_images"].append(patient_id)
+        if key in label_ids:
+            result["labels_in_list"] += 1
+        else:
+            result["patients_missing_labels"].append(patient_id)
+        if key in csf_values and csf_values[key] is not None:
+            result["patients_with_csf"] += 1
+            csf_list.append(csf_values[key])
+        else:
+            result["patients_missing_csf"].append(patient_id)
+
+    if csf_list:
+        result["csf_range"]["min"] = float(min(csf_list))
+        result["csf_range"]["max"] = float(max(csf_list))
+        result["csf_range"]["mean"] = float(np.mean(csf_list))
+
+    list_keys = set(patient_ids.keys())
+    result["images_missing_from_list"] = sorted(
+        p for p in image_ids if p not in list_keys
+    )
+    result["labels_missing_from_list"] = sorted(
+        p for p in label_ids if p not in list_keys
+    )
+
+    return result
 
 
 def batch_process(
     images_dir: str,
     labels_dir: str,
     output_dir: str,
-    csf_file: str,
     patient_list_file: str,
-    patient_id_column: str = "patient_id",
     n4_shrink_factor: int = 4,
-) -> int:
-    images_root, labels_root = Path(images_dir), Path(labels_dir)
-    requested = load_patient_ids(patient_list_file, patient_id_column)
-    candidates = list(images_root.glob("*.nii")) + list(images_root.glob("*.nii.gz"))
-    images, missing = filter_paths_to_patients(candidates, requested)
-    if missing:
-        names = [requested[key] for key in sorted(missing)]
-        raise FileNotFoundError(f"Requested patients without MRI: {names}")
-    csf_data = load_csf_data(csf_file)
-    missing_csf = set(requested) - set(csf_data)
-    if missing_csf:
-        names = [requested[key] for key in sorted(missing_csf)]
-        raise KeyError(f"Requested patients without CSF reference: {names}")
+    continue_on_error: bool = True,
+) -> Dict:
+    """批量预处理。
 
-    logs = []
+    Args:
+        images_dir: 原始图像目录
+        labels_dir: 分割标签目录
+        output_dir: 输出目录
+        patient_list_file: 病人列表 Excel（含 patient_id 和 CSF 值）
+        n4_shrink_factor: N4 缩小因子
+        continue_on_error: 单个病人失败时是否继续
+
+    Returns:
+        汇总字典
+    """
+    images_root, labels_root, output_root = map(
+        Path, (images_dir, labels_dir, output_dir)
+    )
+
+    patient_ids, csf_values = load_patient_list_with_csf(patient_list_file)
+
+    validation = validate_input_consistency(
+        patient_ids, csf_values, images_root, labels_root
+    )
+    print(f"\n输入数据一致性验证:")
+    print(f"  PATIENT_LIST_FILE 病人数: {validation['total_in_patient_list']}")
+    print(f"  图像目录总文件数: {validation['total_images_found']}")
+    print(f"  标签目录总文件数: {validation['total_labels_found']}")
+    print(f"  列表中有图像的病人: {validation['images_in_list']}")
+    print(f"  列表中有标签的病人: {validation['labels_in_list']}")
+    print(f"  列表中有 CSF 值的病人: {validation['patients_with_csf']}")
+    if validation["patients_missing_images"]:
+        print(f"  列表中缺少图像的病人 ({len(validation['patients_missing_images'])}): {validation['patients_missing_images'][:5]}...")
+    if validation["patients_missing_labels"]:
+        print(f"  列表中缺少标签的病人 ({len(validation['patients_missing_labels'])}): {validation['patients_missing_labels'][:5]}...")
+    if validation["images_missing_from_list"]:
+        print(f"  图像中不在列表里的 ({len(validation['images_missing_from_list'])}): {validation['images_missing_from_list'][:5]}...")
+    if validation["labels_missing_from_list"]:
+        print(f"  标签中不在列表里的 ({len(validation['labels_missing_from_list'])}): {validation['labels_missing_from_list'][:5]}...")
+    print()
+
+    candidates = list(images_root.glob("*.nii")) + list(images_root.glob("*.nii.gz"))
+    images, missing = filter_paths_to_patients(candidates, patient_ids)
+    if missing:
+        names = [patient_ids[key] for key in sorted(missing)]
+        raise FileNotFoundError(f"缺少 MRI 图像的患者: {names}")
+
+    successful = []
+    failed = []
     for image_path in tqdm(images, desc="v7 图像预处理"):
         key = canonical_patient_id(patient_id_from_nifti(image_path))
-        patient_id = requested[key]
-        label_path = _find_label(labels_root, patient_id)
-        info = csf_data[key]
-        logs.append(process_single_patient(
-            str(image_path), str(label_path), patient_id,
-            str(Path(output_dir) / patient_id), info["mean"], info["median"],
-            n4_shrink_factor,
-        ))
+        patient_id = patient_ids[key]
+        try:
+            label_path = _find_label(labels_root, patient_id)
+            csf_mean = csf_values[key]
+            log = process_single_patient(
+                str(image_path),
+                str(label_path),
+                patient_id,
+                str(output_root / patient_id),
+                csf_mean=csf_mean,
+                csf_median=None,
+                n4_shrink_factor=n4_shrink_factor,
+            )
+            successful.append(log)
+        except Exception as e:
+            error_msg = str(e)
+            error_type = type(e).__name__
+            failed.append({
+                "patient_id": patient_id,
+                "reason": error_msg,
+                "error_type": error_type,
+            })
+            tqdm.write(f"  ⚠️  {patient_id} 预处理失败: {error_type} - {error_msg}")
+            if not continue_on_error:
+                raise
+
+    output_root.mkdir(parents=True, exist_ok=True)
     summary = {
-        "version": "v7", "requested_count": len(requested),
-        "success_count": len(logs), "patient_ids": [x["patient_id"] for x in logs],
+        "version": "v7",
+        "total_requested": len(patient_ids),
+        "success_count": len(successful),
+        "failed_count": len(failed),
+        "successful_patients": [x["patient_id"] for x in successful],
+        "failed_patients": failed,
+        "index_by": "patient_id",
+        "continue_on_error": continue_on_error,
+        "validation": validation,
     }
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    (Path(output_dir) / "batch_processing_log_v7.json").write_text(
+    (output_root / "batch_processing_log_v7.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return len(logs)
+    print(f"\nv7 预处理完成：成功 {len(successful)}/{len(patient_ids)} 人，失败 {len(failed)} 人")
+    return summary
 
 
 def main():
-    """使用文件顶部的固定路径执行 311 人预处理。"""
-    count = batch_process(
+    """使用文件顶部的固定路径执行预处理。"""
+    summary = batch_process(
         images_dir=IMAGES_DIR,
         labels_dir=LABELS_DIR,
         output_dir=OUTPUT_DIR,
-        csf_file=CSF_FILE,
         patient_list_file=PATIENT_LIST_FILE,
-        patient_id_column="patient_id",
         n4_shrink_factor=4,
+        continue_on_error=True,
     )
-    print(f"v7 预处理完成：成功处理 {count} 名目标患者。")
+    print(f"\n输出目录: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
