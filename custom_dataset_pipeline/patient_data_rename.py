@@ -4,10 +4,10 @@ import re
 from pathlib import Path
 
 # ==================== 配置区域 ====================
-IMAGE_DIR = r"D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\images"
+IMAGE_DIR = r"D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\labels"
 CSV_PATH = r"D:\dataset\yaozhui\QiLuhospital\feature_extraction_20260421dataset_prediction_results\Dataset201_LumbarMuscle_predictions800\PATIENT_LIST_FILE.csv"
 HAS_HEADER = True   # 如果CSV第一行是表头，设为True
-DRY_RUN = True      # 试运行模式（改为False时实际执行）
+DRY_RUN = False # 试运行模式（改为False时实际执行）
 # ================================================
 
 def main():
@@ -43,7 +43,7 @@ def main():
         print(f"错误：图像文件夹 '{IMAGE_DIR}' 不存在。")
         return
 
-    pattern = re.compile(r'^(.+)_0000\.nii\.gz$')
+    pattern = re.compile(r'^(.+)\.nii\.gz$')
     renamed_count = 0
     missing_count = 0
     skip_count = 0
@@ -59,7 +59,7 @@ def main():
         pinyin = match.group(1)
         if pinyin in pinyin_to_id:
             patient_id = pinyin_to_id[pinyin]
-            new_filename = f"{patient_id}_{pinyin}_0000.nii.gz"
+            new_filename = f"{patient_id}_{pinyin}.nii.gz"
             new_path = file_path.parent / new_filename
 
             if new_path.exists():

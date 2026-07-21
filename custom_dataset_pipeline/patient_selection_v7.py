@@ -51,7 +51,7 @@ def load_patient_list_with_csf(
     """从 PATIENT_LIST_FILE 读取病人列表和 CSF 值。
 
     Args:
-        path: Excel 文件路径
+        path: CSV 或 Excel 文件路径
         patient_id_col: patient_id 所在列索引（0-based，第1列）
         csf_col: CSF 值所在列索引（0-based，第4列）
         label_col: label 所在列索引（0-based，第5列）
@@ -66,7 +66,14 @@ def load_patient_list_with_csf(
     if not source.exists():
         raise FileNotFoundError(f"患者名单不存在：{source}")
 
-    frame = pd.read_excel(source, header=None)
+    suffix = source.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        frame = pd.read_excel(source, header=None)
+    elif suffix in {".csv", ".tsv"}:
+        sep = "\t" if suffix == ".tsv" else ","
+        frame = pd.read_csv(source, header=None, sep=sep, encoding="gbk")
+    else:
+        raise ValueError(f"不支持的患者名单格式：{suffix}")
 
     patient_ids: Dict[str, str] = {}
     csf_values: Dict[str, float] = {}
