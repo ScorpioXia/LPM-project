@@ -78,8 +78,10 @@ def load_patient_list_with_csf(
     patient_ids: Dict[str, str] = {}
     csf_values: Dict[str, float] = {}
     skipped_na = []
+    skipped_invalid_csf = []
+    header_skipped = False
 
-    for _, row in frame.iterrows():
+    for idx, row in frame.iterrows():
         raw_id = row.iloc[patient_id_col]
         if pd.isna(raw_id):
             continue
@@ -102,9 +104,12 @@ def load_patient_list_with_csf(
             if not np.isfinite(csf_float) or csf_float <= 0:
                 raise ValueError
         except (ValueError, TypeError):
-            raise ValueError(
-                f"患者 {original_id} 的 CSF 值无效: {csf_val}"
-            )
+            # 第一行CSF值无效，可能是表头，自动跳过
+            if idx == 0:
+                header_skipped = True
+                continue
+            skipped_invalid_csf.append((original_id, str(csf_val)))
+            continue
 
         if canonical in patient_ids:
             raise ValueError(f"重复的 patient_id: {original_id}")
@@ -113,8 +118,16 @@ def load_patient_list_with_csf(
         csf_values[canonical] = csf_float
 
     print(f"从 PATIENT_LIST_FILE 加载了 {len(patient_ids)} 名有效患者")
+    if header_skipped:
+        print(f"  自动跳过表头行（第1行）")
     if skipped_na:
         print(f"  跳过 label 为 #N/A 的患者 {len(skipped_na)} 人")
+    if skipped_invalid_csf:
+        print(f"  跳过 CSF 值无效的患者 {len(skipped_invalid_csf)} 人")
+        for pid, val in skipped_invalid_csf[:5]:
+            print(f"    - {pid}: CSF={val}")
+        if len(skipped_invalid_csf) > 5:
+            print(f"    ... 等 {len(skipped_invalid_csf)} 人")
 
     return patient_ids, csf_values
 
